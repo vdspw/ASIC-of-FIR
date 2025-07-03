@@ -1,0 +1,148 @@
+`include "fircoefs2.v"
+
+module filt (
+    input Clock, Reset,               // System clock and reset
+    input FILTER,                    // Trigger to start filtering
+    input BitIn,                     // Serial bitstream input
+    output logic [15:0] Dout,        // 16-bit filtered output
+    output logic Push                // Pulse when output is valid
+);
+    // FSM state enumeration
+    typedef enum { IDLE, CALC } STATES;
+    STATES PS, NS;
+
+    // Internal registers
+    logic [7:0] cnt0, cnt1, cnt2, cnt3;                // Counters for tap indices
+    logic signed [27:0] mux0, mux1, mux2, mux3;        // Multiplexer outputs
+    logic signed [36:0] adder1, adder2, adder3, acc;   // Adder tree and accumulator
+    logic [511:0] sr1_q, ssr1_q;                      // Shift and snapshot registers
+    logic second_pass;                                 // Flag for second pass
+
+    // Next-state variables
+    logic [7:0] cnt0_d, cnt1_d, cnt2_d, cnt3_d;
+    logic signed [27:0] mux0_d, mux1_d, mux2_d, mux3_d;
+    logic signed [36:0] adder1_d, adder2_d, adder3_d, acc_d;
+    logic [511:0] sr1_d, ssr1_d;
+    logic second_pass_d;
+
+    // Shift register update
+    always_comb begin
+        sr1_d = {BitIn, sr1_q[511:1]};                // Shift in new bit
+        ssr1_d = FILTER ? sr1_q : ssr1_q;             // Snapshot on FILTER
+    end
+
+    // FSM and MAC pipeline (combined)
+    always_comb begin
+        // Default assignments
+        NS = PS;
+        cnt0_d = cnt0;
+        cnt1_d = cnt1;
+        cnt2_d = cnt2;
+        cnt3_d = cnt3;
+        second_pass_d = second_pass;
+        Push = 0;
+        mux0_d = 0;
+        mux1_d = 0;
+        mux2_d = 0;
+        mux3_d = 0;
+        adder1_d = 0;
+        adder2_d = 0;
+        adder3_d = 0;
+        acc_d = acc;
+
+        case (PS)
+            IDLE: begin
+                cnt0_d = 0;
+                cnt1_d = 1;
+                cnt2_d = 2;
+                cnt3_d = 3;
+                second_pass_d = 0;
+                acc_d = 0;                            // Reset accumulator
+                if (FILTER) NS = CALC;
+            end
+            CALC: begin
+                // Process symmetric pairs for four taps
+                case ({ssr1_q[cnt0], ssr1_q[511-cnt0]})
+                    2'b00: mux0_d = 0;
+                    2'b01, 2'b10: mux0_d = coef(cnt0);
+                    2'b11: mux0_d = coef(cnt0) << 1;
+                endcase
+                case ({ssr1_q[cnt1], ssr1_q[511-cnt1]})
+                    2'b00: mux1_d = 0;
+                    2'b01, 2'b10: mux1_d = coef(cnt1);
+                    2'b11: mux1_d = coef(cnt1) << 1;
+                endcase
+                case ({ssr1_q[cnt2], ssr1_q[511-cnt2]})
+                    2'b00: mux2_d = 0;
+                    2'b01, 2'b10: mux2_d = coef(cnt2);
+                    2'b11: mux2_d = coef(cnt2) << 1;
+                endcase
+                case ({ssr1_q[cnt3], ssr1_q[511-cnt3]})
+                    2'b00: mux3_d = 0;
+                    2'b01, 2'b10: mux3_d = coef(cnt3);
+                    2'b11: mux3_d = coef(cnt3) << 1;
+                endcase
+
+                // Adder tree
+                adder1_d = mux0 + mux1;
+                adder2_d = mux2 + mux3;
+                adder3_d = adder1 + adder2;
+                acc_d = acc + adder3;                 // Accumulate result
+
+                // Counter and state control
+                cnt0_d = cnt0 + 4;
+                cnt1_d = cnt1 + 4;
+                cnt2_d = cnt2 + 4;
+                cnt3_d = cnt3 + 4;
+                if (cnt3 == 255) second_pass_d = 1;
+                if (cnt3 == 15 && second_pass) begin
+                    NS = IDLE;
+                    Push = 1;                         // Signal valid output
+                end
+            end
+        endcase
+    end
+
+    // Sequential block (flip-flops)
+    always @(posedge Clock or posedge Reset) begin
+        if (Reset) begin
+            PS <= IDLE;
+            cnt0 <= 0;
+            cnt1 <= 0;
+            cnt2 <= 0;
+            cnt3 <= 0;
+            mux0 <= 0;
+            mux1 <= 0;
+            mux2 <= 0;
+            mux3 <= 0;
+            adder1 <= 0;
+            adder2 <= 0;
+            adder3 <= 0;
+            acc <= 0;
+            sr1_q <= 0;
+            ssr1_q <= 0;
+            second_pass <= 0;
+        end else begin
+            PS <= NS;
+            cnt0 <= cnt0_d;
+            cnt1 <= cnt1_d;
+            cnt2 <= cnt2_d;
+            cnt3 <= cnt3_d;
+            mux0 <= mux0_d;
+            mux1 <= mux1_d;
+            mux2 <= mux2_d;
+            mux3 <= mux3_d;
+            adder1 <= adder1_d;
+            adder2 <= adder2_d;
+            adder3 <= adder3_d;
+            acc <= acc_d;
+            sr1_q <= sr1_d;
+            ssr1_q <= ssr1_d;
+            second_pass <= second_pass_d;
+        end
+    end
+
+    // Output assignment (fixed-point scaling)
+    assign Dout = acc[23:8];
+
+endmodule
